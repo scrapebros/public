@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Update and upgrade the system
+echo "Updating and upgrading the system..."
+apt update && apt upgrade -y
+
+# Fix locale warnings by installing necessary packages and configuring locales
+echo "Installing language packs and fixing locale issues..."
+apt install -y locales language-pack-en
+
+# Forcefully generate and set the locale
+echo "Generating and configuring locales..."
+locale-gen en_US.UTF-8
+update-locale LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
+
+# Apply locale settings globally
+echo "Writing locale settings to /etc/default/locale..."
+cat <<EOF > /etc/default/locale
+LANG=en_US.UTF-8
+LANGUAGE=en_US:en
+LC_ALL=en_US.UTF-8
+EOF
+
+# Ensure locale settings are applied for current shell
+echo "Exporting locale settings for current shell..."
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+
+# Restart services to apply locale changes
+echo "Restarting services to apply locale changes..."
+systemctl restart systemd-localed
+
+# Verify locale settings
+echo "Verifying locale settings..."
+locale
+
+# Install required packages
+echo "Installing curl, git, Docker, and Docker Compose..."
+apt install -y curl git docker-compose docker.io
+
+# Enable and start Docker service
+echo "Starting and enabling Docker service..."
+systemctl enable docker
+systemctl start docker
+
+# Update SSH configuration to allow root login
+echo "Updating SSH configuration to allow root login..."
+SSH_CONFIG="/etc/ssh/sshd_config"
+if grep -q "^PermitRootLogin" $SSH_CONFIG; then
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' $SSH_CONFIG
+else
+    echo "PermitRootLogin yes" >> $SSH_CONFIG
+fi
+
+# Restart SSH service
+echo "Restarting SSH service..."
+systemctl restart ssh
+
+echo "Startup script execution complete!"
