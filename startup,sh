@@ -1,60 +1,55 @@
 #!/bin/bash
 
-# Update and upgrade the system
+# Step 1: Update repository to use old-releases if needed
+echo "Updating /etc/apt/sources.list to use old-releases.ubuntu.com..."
+sed -i '/archive.ubuntu.com/s/^/#/' /etc/apt/sources.list
+if ! grep -q "old-releases.ubuntu.com" /etc/apt/sources.list; then
+    echo "Adding old-releases.ubuntu.com entries..."
+    cat <<EOF >> /etc/apt/sources.list
+deb http://old-releases.ubuntu.com/ubuntu mantic main restricted universe multiverse
+deb http://old-releases.ubuntu.com/ubuntu mantic-updates main restricted universe multiverse
+deb http://old-releases.ubuntu.com/ubuntu mantic-security main restricted universe multiverse
+EOF
+fi
+
+# Step 2: Update and upgrade the system
 echo "Updating and upgrading the system..."
 apt update && apt upgrade -y
 
-# Fix locale warnings by installing necessary packages and configuring locales
-echo "Installing language packs and fixing locale issues..."
-apt install -y locales language-pack-en
+# Step 3: Install necessary language packs and fix locale issues
+echo "Installing necessary language packs and fixing locale issues..."
+apt install -y locales language-pack-en language-pack-en-base || echo "Skipping language packs due to errors."
 
-# Forcefully generate and set the locale
 echo "Generating and configuring locales..."
 locale-gen en_US.UTF-8
 update-locale LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
+echo -e "LANG=en_US.UTF-8\nLANGUAGE=en_US:en\nLC_ALL=en_US.UTF-8" > /etc/default/locale
+source /etc/default/locale
 
-# Apply locale settings globally
-echo "Writing locale settings to /etc/default/locale..."
-cat <<EOF > /etc/default/locale
-LANG=en_US.UTF-8
-LANGUAGE=en_US:en
-LC_ALL=en_US.UTF-8
-EOF
-
-# Ensure locale settings are applied for current shell
-echo "Exporting locale settings for current shell..."
-export LANG=en_US.UTF-8
-export LANGUAGE=en_US:en
-export LC_ALL=en_US.UTF-8
-
-# Restart services to apply locale changes
-echo "Restarting services to apply locale changes..."
-systemctl restart systemd-localed
-
-# Verify locale settings
-echo "Verifying locale settings..."
-locale
-
-# Install required packages
+# Step 4: Install required packages
 echo "Installing curl, git, Docker, and Docker Compose..."
-apt install -y curl git docker-compose docker.io
+apt install -y curl git docker-compose docker.io || echo "Skipping some packages due to errors."
 
-# Enable and start Docker service
+# Step 5: Enable and start Docker service
 echo "Starting and enabling Docker service..."
-systemctl enable docker
-systemctl start docker
+if command -v systemctl &>/dev/null; then
+    systemctl enable docker || echo "Docker service enable failed."
+    systemctl start docker || echo "Docker service start failed."
+else
+    echo "Systemd not found; skipping Docker service management."
+fi
 
-# Update SSH configuration to allow root login
+# Step 6: Update SSH configuration to allow root login
 echo "Updating SSH configuration to allow root login..."
 SSH_CONFIG="/etc/ssh/sshd_config"
-if grep -q "^PermitRootLogin" $SSH_CONFIG; then
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' $SSH_CONFIG
+if grep -q "^PermitRootLogin" "$SSH_CONFIG"; then
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' "$SSH_CONFIG"
 else
-    echo "PermitRootLogin yes" >> $SSH_CONFIG
+    echo "PermitRootLogin yes" >> "$SSH_CONFIG"
 fi
 
 # Restart SSH service
 echo "Restarting SSH service..."
-systemctl restart ssh
+systemctl restart ssh || echo "SSH service restart failed."
 
 echo "Startup script execution complete!"
