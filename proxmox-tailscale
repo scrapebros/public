@@ -1,5 +1,5 @@
 # On the Proxmox host (not inside the container), edit the container config
-vim /etc/pve/lxc/<container-id>.conf
+nano /etc/pve/lxc/<container-id>.conf
 
 # Add these lines:
 lxc.cgroup2.devices.allow: c 10:200 rwm
