@@ -47,7 +47,7 @@ mkdir -p /opt/docker-aicode
 
 # 2) Recursively copy everything from the remote host’s /opt/docker-aicode
 #    to the identical path on your local system.
-scp -r root@192.168.12.147:/opt/docker-aicode/* /opt/docker-aicode/
+#scp -r root@192.168.12.147:/opt/docker-aicode/* /opt/docker-aicode/
 
 # Install nvm (Node Version Manager)
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
