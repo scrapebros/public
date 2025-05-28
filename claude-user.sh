@@ -48,3 +48,20 @@ mkdir -p /opt/docker-aicode
 # 2) Recursively copy everything from the remote host’s /opt/docker-aicode
 #    to the identical path on your local system.
 scp -r root@192.168.12.147:/opt/docker-aicode/* /opt/docker-aicode/
+
+# Install nvm (Node Version Manager)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+
+# Load nvm into current shell session
+\. "$HOME/.nvm/nvm.sh"
+
+# Install Node.js version 22
+nvm install 22
+
+# Verify Node.js and npm versions
+node -v
+nvm current
+npm -v
+
+# Install Claude globally
+npm install -g @anthropic-ai/claude-code
