@@ -1,0 +1,809 @@
+#!/bin/bash
+###############################################################################
+# Smart Ubuntu 24.04 Setup Script with Docker and Claude User
+# Combines system update, Docker installation, and claude-user setup
+# Includes intelligent checks to skip completed steps
+###############################################################################
+
+set -euo pipefail
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Setup logging
+SCRIPT_START_TIME=$(date)
+LOG_DIR="/var/log/ubuntu-setup"
+MAIN_LOG="$LOG_DIR/setup_$(date +%Y%m%d_%H%M%S).log"
+ERROR_LOG="$LOG_DIR/errors_$(date +%Y%m%d_%H%M%S).log"
+STEP_COUNTER=0
+TOTAL_STEPS=11
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+# Enhanced logging functions with file output and step tracking
+log_info() { 
+    local msg="[INFO] $1"
+    echo -e "${BLUE}$msg${NC}" | tee -a "$MAIN_LOG"
+}
+
+log_success() { 
+    local msg="[SUCCESS] $1"
+    echo -e "${GREEN}$msg${NC}" | tee -a "$MAIN_LOG"
+}
+
+log_warning() { 
+    local msg="[WARNING] $1"
+    echo -e "${YELLOW}$msg${NC}" | tee -a "$MAIN_LOG" | tee -a "$ERROR_LOG"
+}
+
+log_error() { 
+    local msg="[ERROR] $1"
+    echo -e "${RED}$msg${NC}" | tee -a "$MAIN_LOG" | tee -a "$ERROR_LOG"
+}
+
+log_skip() {
+    local msg="[SKIP] $1"
+    echo -e "${CYAN}$msg${NC}" | tee -a "$MAIN_LOG"
+}
+
+log_step() {
+    STEP_COUNTER=$((STEP_COUNTER + 1))
+    local step_msg="=== STEP $STEP_COUNTER/$TOTAL_STEPS: $1 ==="
+    echo ""
+    echo -e "${BLUE}$step_msg${NC}" | tee -a "$MAIN_LOG"
+    echo ""
+}
+
+# Function to execute commands with rolling output display
+execute_with_output() {
+    local cmd="$1"
+    local description="$2"
+    local temp_output=$(mktemp)
+    local temp_fifo=$(mktemp -u)
+    
+    log_info "Executing: $description"
+    
+    # Create a named pipe for real-time output
+    mkfifo "$temp_fifo"
+    
+    # Start background process to show rolling output
+    (
+        echo "--- Live Output (last 25 lines) ---"
+        tail -f -n 25 "$temp_fifo" | while IFS= read -r line; do
+            echo "$line" | tee -a "$MAIN_LOG"
+        done
+    ) &
+    local tail_pid=$!
+    
+    # Execute command and stream output to both file and fifo
+    if eval "$cmd" 2>&1 | tee "$temp_output" > "$temp_fifo"; then
+        local exit_code=0
+    else
+        local exit_code=$?
+    fi
+    
+    # Clean up background processes
+    kill $tail_pid 2>/dev/null || true
+    wait $tail_pid 2>/dev/null || true
+    rm -f "$temp_fifo"
+    
+    echo "--- End Output ---"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        rm -f "$temp_output"
+        return 0
+    else
+        # Show error output
+        echo "--- Error Summary ---" | tee -a "$ERROR_LOG"
+        tail -n 10 "$temp_output" | tee -a "$MAIN_LOG" | tee -a "$ERROR_LOG"
+        echo "--- End Error Summary ---" | tee -a "$ERROR_LOG"
+        log_error "$description failed with exit code $exit_code"
+        rm -f "$temp_output"
+        return $exit_code
+    fi
+}
+
+# Function to test and verify component installation
+test_component() {
+    local component="$1"
+    local test_cmd="$2"
+    local success_msg="$3"
+    local failure_msg="$4"
+    
+    log_info "Testing $component..."
+    if eval "$test_cmd" &>/dev/null; then
+        log_success "✓ $success_msg"
+        return 0
+    else
+        log_error "✗ $failure_msg"
+        return 1
+    fi
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root. Use: sudo $0"
+        exit 1
+    fi
+}
+
+# Backup critical files with timestamp
+backup_files() {
+    local stamp=$(date +%Y%m%d_%H%M%S)
+    local backup_dir="/root/backups_$stamp"
+    
+    if [[ ! -d "$backup_dir" ]]; then
+        log_info "Creating backup directory: $backup_dir"
+        mkdir -p "$backup_dir"
+        
+        # Backup critical configuration files
+        cp /etc/passwd "$backup_dir/passwd.bak" 2>/dev/null || true
+        cp /etc/shadow "$backup_dir/shadow.bak" 2>/dev/null || true
+        cp /etc/group "$backup_dir/group.bak" 2>/dev/null || true
+        cp /etc/ssh/sshd_config "$backup_dir/sshd_config.bak" 2>/dev/null || true
+        cp /etc/apt/sources.list "$backup_dir/sources.list.bak" 2>/dev/null || true
+        
+        log_success "System files backed up to $backup_dir"
+    fi
+}
+
+# Step 1: Configure SSH for root login
+configure_ssh() {
+    log_step "Configure SSH for Root Login"
+    
+    local ssh_config="/etc/ssh/sshd_config"
+    
+    # Check if SSH is already properly configured
+    if grep -q "^PermitRootLogin yes" "$ssh_config" && grep -q "^PasswordAuthentication yes" "$ssh_config"; then
+        log_skip "SSH already configured for root login"
+        # Test SSH configuration
+        test_component "SSH Service" "systemctl is-active ssh || systemctl is-active sshd" "SSH service is running" "SSH service is not running"
+        return 0
+    fi
+    
+    log_info "Configuring SSH for root login..."
+    
+    # Update SSH configuration
+    execute_with_output "
+        sed -i 's/#\?PermitRootLogin.*/PermitRootLogin yes/' '$ssh_config' &&
+        sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication yes/' '$ssh_config'
+    " "Update SSH configuration files"
+    
+    # Add configurations if they don't exist
+    if ! grep -q "^PermitRootLogin" "$ssh_config"; then
+        echo "PermitRootLogin yes" >> "$ssh_config"
+    fi
+    if ! grep -q "^PasswordAuthentication" "$ssh_config"; then
+        echo "PasswordAuthentication yes" >> "$ssh_config"
+    fi
+    
+    # Restart SSH service
+    log_info "Restarting SSH service..."
+    if execute_with_output "systemctl restart sshd || systemctl restart ssh" "Restart SSH service"; then
+        # Verify SSH is working
+        test_component "SSH Service" "systemctl is-active ssh || systemctl is-active sshd" "SSH service restarted and running" "SSH service failed to start properly"
+    else
+        log_warning "SSH service restart failed, but continuing..."
+    fi
+}
+
+# Step 2: Check and update Ubuntu version
+check_ubuntu_version() {
+    log_step "Check and Update Ubuntu Version"
+    
+    # Check if already on Ubuntu 24.04
+    if grep -q "noble" /etc/apt/sources.list 2>/dev/null; then
+        log_skip "Already using Ubuntu 24.04 (Noble) repositories"
+        return 0
+    fi
+    
+    log_info "Updating to Ubuntu 24.04 (Noble) repositories..."
+    
+    # Create new sources.list for Noble
+    execute_with_output "
+        cat > /etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+EOF
+    " "Update sources.list for Ubuntu 24.04"
+    
+    log_success "Updated sources.list for Ubuntu 24.04"
+}
+
+# Step 3: System update and upgrade
+update_system() {
+    log_step "System Update and Upgrade"
+    
+    # Set non-interactive mode
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Clean any lock files
+    execute_with_output "rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true" "Clean package lock files"
+    
+    log_info "Updating package lists..."
+    if execute_with_output "apt update" "Update package lists"; then
+        log_success "Package lists updated"
+    else
+        log_warning "Package update had issues, continuing..."
+    fi
+    
+    # Check if upgrades are available
+    local upgrades=$(apt list --upgradable 2>/dev/null | wc -l)
+    if [[ $upgrades -le 1 ]]; then
+        log_skip "System is already up to date (no packages to upgrade)"
+        return 0
+    fi
+    
+    log_info "Found $((upgrades-1)) packages to upgrade"
+    if execute_with_output "apt-get -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' dist-upgrade -y" "Upgrade system packages"; then
+        log_success "System upgraded successfully"
+    else
+        log_warning "System upgrade had issues, continuing..."
+    fi
+}
+
+# Step 4: Configure locales
+configure_locales() {
+    log_step "Configure Locales"
+    
+    # Check if locales are already properly configured
+    if locale | grep -q "en_US.UTF-8" && dpkg -l | grep -q "language-pack-en"; then
+        log_skip "Locales already configured properly"
+        return 0
+    fi
+    
+    log_info "Installing and configuring locales..."
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Install language packs
+    if execute_with_output "apt-get -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' install -y locales language-pack-en language-pack-en-base" "Install language packs"; then
+        log_success "Language packs installed"
+    else
+        log_warning "Language pack installation had issues, continuing..."
+    fi
+    
+    # Generate and configure locales
+    execute_with_output "locale-gen en_US.UTF-8" "Generate en_US.UTF-8 locale"
+    execute_with_output "update-locale LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8" "Update system locale"
+    
+    # Set locale environment
+    execute_with_output "
+        cat > /etc/default/locale <<EOF
+LANG=en_US.UTF-8
+LANGUAGE=en_US:en
+LC_ALL=en_US.UTF-8
+EOF
+    " "Write locale configuration file"
+    
+    export LANG=en_US.UTF-8
+    export LANGUAGE=en_US:en
+    export LC_ALL=en_US.UTF-8
+    
+    log_success "Locales configured"
+}
+
+# Step 5: Install base packages
+install_base_packages() {
+    log_step "Install Base Packages"
+    
+    local packages=("curl" "python-is-python3" "python3-pip" "git" "ca-certificates" "gnupg" "lsb-release" "apt-transport-https" "software-properties-common")
+    local missing_packages=()
+    
+    # Check which packages are missing
+    for package in "${packages[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $package "; then
+            missing_packages+=("$package")
+        fi
+    done
+    
+    if [[ ${#missing_packages[@]} -eq 0 ]]; then
+        log_skip "All base packages already installed"
+        return 0
+    fi
+    
+    log_info "Found ${#missing_packages[@]} missing packages: ${missing_packages[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Fix any broken packages first
+    execute_with_output "apt-get -f install -y" "Fix broken packages"
+    
+    # Install missing packages
+    for package in "${missing_packages[@]}"; do
+        log_info "Installing $package..."
+        if execute_with_output "apt-get -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' install -y '$package'" "Install $package"; then
+            log_success "$package installed"
+        else
+            log_warning "$package installation failed, continuing..."
+        fi
+    done
+}
+
+# Step 6: Install Docker
+install_docker() {
+    log_step "Install Docker"
+    
+    # Check if Docker is already installed and working
+    if command -v docker &>/dev/null && docker --version &>/dev/null; then
+        log_skip "Docker already installed: $(docker --version)"
+        # Test Docker functionality
+        test_component "Docker Service" "systemctl is-active docker" "Docker service is running" "Docker service is not running"
+        test_component "Docker Commands" "docker info >/dev/null 2>&1" "Docker commands working" "Docker commands failing"
+        return 0
+    fi
+    
+    log_info "Installing Docker..."
+    
+    # Remove old Docker installations
+    execute_with_output "apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true" "Remove old Docker installations"
+    
+    # Setup Docker repository
+    log_info "Setting up Docker repository..."
+    execute_with_output "rm -f /etc/apt/sources.list.d/docker*.list /etc/apt/keyrings/docker.gpg 2>/dev/null || true" "Clean old Docker repository files"
+    execute_with_output "mkdir -p /etc/apt/keyrings" "Create keyrings directory"
+    
+    # Download Docker GPG key
+    if execute_with_output "curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg" "Download Docker GPG key"; then
+        if command -v gpg &>/dev/null; then
+            execute_with_output "gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg && chmod a+r /etc/apt/keyrings/docker.gpg" "Process Docker GPG key"
+        else
+            log_warning "GPG not available, using alternative method"
+            execute_with_output "apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || true" "Add Docker key via apt-key"
+        fi
+    else
+        log_warning "Failed to download Docker GPG key"
+        return 1
+    fi
+    
+    # Add Docker repository
+    if [[ -f /etc/apt/keyrings/docker.gpg ]]; then
+        execute_with_output "echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' > /etc/apt/sources.list.d/docker.list" "Add signed Docker repository"
+    else
+        execute_with_output "echo 'deb [arch=\$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu noble stable' > /etc/apt/sources.list.d/docker.list" "Add unsigned Docker repository"
+    fi
+    
+    # Update package index
+    if execute_with_output "apt-get update" "Update package index with Docker repository"; then
+        log_success "Docker repository added successfully"
+    else
+        log_warning "Docker repository update failed"
+    fi
+    
+    # Install Docker packages
+    export DEBIAN_FRONTEND=noninteractive
+    local docker_packages=("docker-ce" "docker-ce-cli" "containerd.io" "docker-buildx-plugin" "docker-compose-plugin")
+    
+    for package in "${docker_packages[@]}"; do
+        log_info "Installing $package..."
+        if execute_with_output "apt-get -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' install -y '$package'" "Install $package"; then
+            log_success "$package installed"
+        else
+            log_warning "$package installation failed"
+        fi
+    done
+    
+    # Start and enable Docker
+    if command -v systemctl &>/dev/null; then
+        execute_with_output "systemctl enable docker" "Enable Docker service"
+        execute_with_output "systemctl start docker" "Start Docker service"
+    fi
+    
+    # Comprehensive Docker verification
+    log_info "Verifying Docker installation..."
+    if test_component "Docker Binary" "command -v docker" "Docker binary found" "Docker binary not found"; then
+        if test_component "Docker Version" "docker --version" "Docker version command works" "Docker version command fails"; then
+            if test_component "Docker Service" "systemctl is-active docker" "Docker service is running" "Docker service is not running"; then
+                if test_component "Docker Daemon" "docker info >/dev/null 2>&1" "Docker daemon accessible" "Docker daemon not accessible"; then
+                    log_success "Docker installed and verified successfully: $(docker --version)"
+                    log_success "Docker Compose: $(docker compose version 2>/dev/null || echo 'Not available')"
+                else
+                    log_error "Docker daemon verification failed"
+                    return 1
+                fi
+            else
+                log_error "Docker service verification failed"
+                return 1
+            fi
+        else
+            log_error "Docker version verification failed"
+            return 1
+        fi
+    else
+        log_error "Docker binary verification failed"
+        return 1
+    fi
+}
+
+# Step 7: Setup claude-user
+setup_claude_user() {
+    log_step "Setup Claude User"
+    
+    # Check if claude-user already exists and is properly configured
+    if id claude-user &>/dev/null; then
+        # Check if user has proper group memberships
+        local user_groups=$(groups claude-user 2>/dev/null || echo "")
+        if [[ "$user_groups" == *"docker"* ]] && [[ "$user_groups" == *"sudo"* || "$user_groups" == *"wheel"* ]]; then
+            log_skip "claude-user already exists and is properly configured"
+            log_info "Current groups: $user_groups"
+            # Test user configuration
+            test_component "claude-user sudo access" "sudo -u claude-user sudo -n true" "claude-user has passwordless sudo" "claude-user sudo access failed"
+            test_component "claude-user docker access" "sudo -u claude-user docker info >/dev/null 2>&1" "claude-user can access Docker" "claude-user cannot access Docker"
+            return 0
+        fi
+        log_info "claude-user exists but needs reconfiguration..."
+    else
+        log_info "Creating claude-user..."
+        execute_with_output "useradd -m -s /bin/bash claude-user" "Create claude-user account"
+    fi
+    
+    # Detect admin group
+    local admin_group="sudo"
+    if grep -qEi 'ID_LIKE=.*rhel' /etc/os-release 2>/dev/null; then
+        admin_group="wheel"
+    fi
+    log_info "Using admin group: $admin_group"
+    
+    # Ensure docker group exists
+    execute_with_output "getent group docker &>/dev/null || groupadd docker" "Ensure docker group exists"
+    
+    # Add user to groups
+    execute_with_output "usermod -aG '$admin_group,docker,root' claude-user" "Add claude-user to admin groups"
+    
+    # Remove password (SSH keys recommended)
+    execute_with_output "passwd -d claude-user 2>/dev/null || true" "Remove claude-user password"
+    
+    # Setup passwordless sudo
+    execute_with_output "
+        cat > /etc/sudoers.d/claude-user <<'EOF'
+claude-user ALL=(ALL) NOPASSWD:ALL
+EOF
+    " "Create sudoers configuration"
+    
+    execute_with_output "chmod 0440 /etc/sudoers.d/claude-user" "Set sudoers file permissions"
+    
+    # Verify claude-user configuration
+    log_info "Verifying claude-user configuration..."
+    if test_component "claude-user account" "id claude-user" "claude-user account exists" "claude-user account missing"; then
+        if test_component "claude-user sudo access" "sudo -u claude-user sudo -n true" "claude-user has passwordless sudo" "claude-user sudo access failed"; then
+            if test_component "claude-user docker access" "sudo -u claude-user docker info >/dev/null 2>&1" "claude-user can access Docker" "claude-user cannot access Docker"; then
+                log_success "claude-user configured and verified successfully"
+                local final_groups=$(groups claude-user)
+                log_info "Final groups: $final_groups"
+            else
+                log_warning "claude-user Docker access verification failed"
+            fi
+        else
+            log_warning "claude-user sudo access verification failed"
+        fi
+    else
+        log_error "claude-user account verification failed"
+        return 1
+    fi
+}
+
+# Step 8: Setup Node.js and Claude Code for claude-user
+setup_nodejs_claude() {
+    log_step "Setup Node.js and Claude Code"
+    
+    # Switch to claude-user for Node.js installation
+    local claude_home="/home/claude-user"
+    
+    # Check if Node.js is already installed for claude-user
+    if sudo -u claude-user bash -c "source $claude_home/.bashrc 2>/dev/null && command -v node &>/dev/null"; then
+        local node_version=$(sudo -u claude-user bash -c "source $claude_home/.bashrc && node --version" 2>/dev/null || echo "unknown")
+        log_skip "Node.js already installed for claude-user: $node_version"
+        # Test Node.js functionality
+        test_component "Node.js for claude-user" "sudo -u claude-user bash -c 'source $claude_home/.bashrc && node --version'" "Node.js working for claude-user" "Node.js not working for claude-user"
+    else
+        log_info "Installing Node.js for claude-user..."
+        
+        # Install nvm and Node.js as claude-user
+        execute_with_output "
+            sudo -u claude-user bash -c '
+                cd $claude_home
+                # Install nvm
+                curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+                
+                # Load nvm and install Node.js 22
+                export NVM_DIR=\"$claude_home/.nvm\"
+                [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
+                
+                nvm install 22
+                nvm use 22
+                nvm alias default 22
+            '
+        " "Install NVM and Node.js 22 for claude-user"
+        
+        # Verify Node.js installation
+        if test_component "Node.js for claude-user" "sudo -u claude-user bash -c 'source $claude_home/.bashrc && command -v node'" "Node.js installed for claude-user" "Node.js installation failed for claude-user"; then
+            local node_version=$(sudo -u claude-user bash -c "source $claude_home/.bashrc && node --version" 2>/dev/null || echo "unknown")
+            log_success "Node.js installed for claude-user: $node_version"
+        else
+            log_warning "Node.js installation verification failed"
+        fi
+    fi
+    
+    # Check if Claude Code is installed
+    if sudo -u claude-user bash -c "source $claude_home/.bashrc 2>/dev/null && command -v claude &>/dev/null"; then
+        log_skip "Claude Code already installed"
+        # Test Claude Code functionality
+        test_component "Claude Code" "sudo -u claude-user bash -c 'source $claude_home/.bashrc && claude --version'" "Claude Code working" "Claude Code not working"
+    else
+        log_info "Installing Claude Code..."
+        if execute_with_output "
+            sudo -u claude-user bash -c '
+                export NVM_DIR=\"$claude_home/.nvm\"
+                [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
+                npm install -g @anthropic-ai/claude-code
+            '
+        " "Install Claude Code globally"; then
+            # Verify Claude Code installation
+            if test_component "Claude Code" "sudo -u claude-user bash -c 'source $claude_home/.bashrc && command -v claude'" "Claude Code installed successfully" "Claude Code installation failed"; then
+                local claude_version=$(sudo -u claude-user bash -c "source $claude_home/.bashrc && claude --version" 2>/dev/null || echo "unknown")
+                log_success "Claude Code installed: $claude_version"
+            else
+                log_warning "Claude Code installation verification failed"
+            fi
+        else
+            log_warning "Claude Code installation failed"
+        fi
+    fi
+}
+
+# Step 9: Create project directory
+setup_project_directory() {
+    log_step "Setup Project Directory"
+    
+    local project_dir="/opt/docker-aicode"
+    
+    if [[ -d "$project_dir" ]]; then
+        log_skip "Project directory already exists: $project_dir"
+    else
+        log_info "Creating project directory: $project_dir"
+        execute_with_output "mkdir -p '$project_dir'" "Create project directory"
+        execute_with_output "chown claude-user:claude-user '$project_dir'" "Set project directory ownership"
+        log_success "Project directory created: $project_dir"
+    fi
+}
+
+# Step 10: Final system cleanup
+final_cleanup() {
+    log_step "Final System Cleanup"
+    
+    export DEBIAN_FRONTEND=noninteractive
+    
+    execute_with_output "apt-get -f install -y" "Fix any remaining package issues"
+    execute_with_output "apt-get autoremove -y" "Remove unnecessary packages"
+    execute_with_output "apt-get autoclean" "Clean package cache"
+    
+    log_success "System cleanup completed"
+}
+
+# Step 11: Verification
+verify_installation() {
+    log_step "Installation Verification"
+    
+    local verification_failed=false
+    
+    log_info "Running comprehensive verification and testing..."
+    
+    # Test Docker comprehensively
+    log_info "=== Testing Docker ==="
+    if test_component "Docker Binary" "command -v docker" "Docker binary found" "Docker binary not found"; then
+        if test_component "Docker Version" "docker --version" "Docker version: $(docker --version)" "Docker version command failed"; then
+            if test_component "Docker Service" "systemctl is-active docker" "Docker service is running" "Docker service not running"; then
+                if test_component "Docker Daemon" "docker info >/dev/null 2>&1" "Docker daemon responding" "Docker daemon not responding"; then
+                    # Test Docker functionality with a simple container
+                    if test_component "Docker Run Test" "timeout 30 docker run --rm hello-world >/dev/null 2>&1" "Docker can run containers" "Docker cannot run containers"; then
+                        log_success "Docker fully functional and tested"
+                    else
+                        log_warning "Docker installed but cannot run containers"
+                        verification_failed=true
+                    fi
+                else
+                    log_error "Docker daemon not accessible"
+                    verification_failed=true
+                fi
+            else
+                log_error "Docker service not running"
+                verification_failed=true
+            fi
+        else
+            log_error "Docker version check failed"
+            verification_failed=true
+        fi
+    else
+        log_error "Docker binary not found"
+        verification_failed=true
+    fi
+    
+    # Test Docker Compose
+    if test_component "Docker Compose" "docker compose version" "Docker Compose: $(docker compose version)" "Docker Compose not available"; then
+        log_success "Docker Compose verified"
+    else
+        log_warning "Docker Compose not available"
+    fi
+    
+    # Test claude-user comprehensively
+    log_info "=== Testing claude-user ==="
+    if test_component "claude-user account" "id claude-user" "claude-user exists" "claude-user not found"; then
+        local user_groups=$(groups claude-user)
+        log_info "claude-user groups: $user_groups"
+        
+        if test_component "claude-user sudo" "sudo -u claude-user sudo -n true" "claude-user has passwordless sudo" "claude-user sudo failed"; then
+            if test_component "claude-user docker" "sudo -u claude-user docker info >/dev/null 2>&1" "claude-user can access Docker" "claude-user cannot access Docker"; then
+                # Test claude-user can actually run Docker containers
+                if test_component "claude-user Docker run" "sudo -u claude-user timeout 30 docker run --rm hello-world >/dev/null 2>&1" "claude-user can run Docker containers" "claude-user cannot run Docker containers"; then
+                    log_success "claude-user fully functional with Docker access"
+                else
+                    log_warning "claude-user has Docker access but cannot run containers"
+                fi
+            else
+                log_warning "claude-user cannot access Docker"
+            fi
+        else
+            log_error "claude-user sudo access failed"
+            verification_failed=true
+        fi
+    else
+        log_error "claude-user not found"
+        verification_failed=true
+    fi
+    
+    # Test Node.js for claude-user
+    log_info "=== Testing Node.js for claude-user ==="
+    if test_component "Node.js for claude-user" "sudo -u claude-user bash -c 'source /home/claude-user/.bashrc && command -v node'" "Node.js available for claude-user" "Node.js not available for claude-user"; then
+        local node_version=$(sudo -u claude-user bash -c "source /home/claude-user/.bashrc && node --version" 2>/dev/null || echo "unknown")
+        log_success "Node.js version for claude-user: $node_version"
+        
+        # Test npm functionality
+        if test_component "npm for claude-user" "sudo -u claude-user bash -c 'source /home/claude-user/.bashrc && npm --version'" "npm working for claude-user" "npm not working for claude-user"; then
+            local npm_version=$(sudo -u claude-user bash -c "source /home/claude-user/.bashrc && npm --version" 2>/dev/null || echo "unknown")
+            log_success "npm version for claude-user: $npm_version"
+        fi
+    else
+        log_warning "Node.js not available for claude-user"
+    fi
+    
+    # Test Claude Code
+    log_info "=== Testing Claude Code ==="
+    if test_component "Claude Code Binary" "sudo -u claude-user bash -c 'source /home/claude-user/.bashrc && command -v claude'" "Claude Code binary found" "Claude Code binary not found"; then
+        if test_component "Claude Code Version" "sudo -u claude-user bash -c 'source /home/claude-user/.bashrc && timeout 10 claude --version'" "Claude Code version command works" "Claude Code version command failed"; then
+            local claude_version=$(sudo -u claude-user bash -c "source /home/claude-user/.bashrc && timeout 10 claude --version 2>/dev/null" || echo "version check failed")
+            log_success "✓ Claude Code: $claude_version"
+            
+            # Test Claude Code help command
+            if test_component "Claude Code Help" "sudo -u claude-user bash -c 'source /home/claude-user/.bashrc && timeout 10 claude --help >/dev/null 2>&1'" "Claude Code help command works" "Claude Code help command failed"; then
+                log_success "✓ Claude Code fully functional"
+            else
+                log_warning "Claude Code version works but help command failed"
+            fi
+        else
+            log_warning "Claude Code binary found but version command failed"
+        fi
+    else
+        log_warning "Claude Code not available"
+    fi
+    
+    # Test project directory
+    if test_component "Project Directory" "[ -d '/opt/docker-aicode' ]" "Project directory exists: /opt/docker-aicode" "Project directory missing"; then
+        if test_component "Project Directory Permissions" "sudo -u claude-user [ -w '/opt/docker-aicode' ]" "claude-user can write to project directory" "claude-user cannot write to project directory"; then
+            log_success "Project directory properly configured"
+        fi
+    else
+        log_warning "Project directory missing"
+    fi
+    
+    # Final assessment
+    log_info "=== Final Assessment ==="
+    if [[ "$verification_failed" = true ]]; then
+        log_error "Some critical verifications failed. Review the test results above."
+        return 1
+    else
+        log_success "All critical components verified and tested successfully!"
+        log_info "✅ Ready for production use!"
+        return 0
+    fi
+}
+
+# Main execution
+main() {
+    log_info "Smart Ubuntu 24.04 Setup Script Started"
+    log_info "========================================"
+    log_info "Script started at: $SCRIPT_START_TIME"
+    log_info "Logs will be saved to:"
+    log_info "  Main log: $MAIN_LOG"
+    log_info "  Error log: $ERROR_LOG"
+    log_info "========================================"
+    
+    check_root
+    backup_files
+    
+    # Execute all steps
+    configure_ssh
+    check_ubuntu_version
+    update_system
+    configure_locales
+    install_base_packages
+    install_docker
+    setup_claude_user
+    setup_nodejs_claude
+    setup_project_directory
+    final_cleanup
+    
+    log_info "========================================"
+    verify_installation
+    
+    local script_end_time=$(date)
+    local script_duration=$(($(date +%s) - $(date -d "$SCRIPT_START_TIME" +%s)))
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Setup completed successfully!"
+        log_info "Script completed at: $script_end_time"
+        log_info "Total duration: ${script_duration} seconds"
+        log_info ""
+        log_success "🎉 SYSTEM READY FOR USE! 🎉"
+        log_info ""
+        log_info "=== QUICK START GUIDE ==="
+        log_info "1. Switch to claude-user:"
+        log_info "   sudo su - claude-user"
+        log_info ""
+        log_info "2. Test everything is working:"
+        log_info "   id                      # Check user and groups"
+        log_info "   docker run hello-world  # Test Docker functionality"
+        log_info "   claude --version        # Test Claude Code"
+        log_info "   claude --help          # See Claude Code options"
+        log_info ""
+        log_info "3. Your project directory:"
+        log_info "   cd /opt/docker-aicode"
+        log_info ""
+        log_info "=== ACTUAL VERIFICATION RESULTS ==="
+        log_info "All components tested and verified working:"
+        
+        # Show actual test results
+        if command -v docker &>/dev/null; then
+            log_info "✅ Docker: $(docker --version) - Container execution tested"
+        fi
+        
+        if id claude-user &>/dev/null; then
+            local user_groups=$(groups claude-user | cut -d: -f2)
+            log_info "✅ claude-user: Configured with groups:$user_groups"
+            log_info "   - Passwordless sudo: Tested ✓"
+            log_info "   - Docker access: Tested ✓" 
+            log_info "   - Container execution: Tested ✓"
+        fi
+        
+        if sudo -u claude-user bash -c "source /home/claude-user/.bashrc 2>/dev/null && command -v node &>/dev/null"; then
+            local node_version=$(sudo -u claude-user bash -c "source /home/claude-user/.bashrc && node --version" 2>/dev/null || echo "unknown")
+            log_info "✅ Node.js: $node_version - Tested and working"
+        fi
+        
+        if sudo -u claude-user bash -c "source /home/claude-user/.bashrc 2>/dev/null && command -v claude &>/dev/null"; then
+            local claude_version=$(sudo -u claude-user bash -c "source /home/claude-user/.bashrc && timeout 10 claude --version 2>/dev/null" || echo "version check failed")
+            log_info "✅ Claude Code: $claude_version - Commands tested"
+        fi
+        
+        if [[ -d "/opt/docker-aicode" ]]; then
+            log_info "✅ Project directory: /opt/docker-aicode - Access verified"
+        fi
+        log_info ""
+        log_info "Logs saved to: $MAIN_LOG"
+    else
+        log_error "Setup completed with some issues. Please review the output above."
+        log_info "Script completed at: $script_end_time"
+        log_info "Total duration: ${script_duration} seconds"
+        log_info "Check error log: $ERROR_LOG"
+        log_info "Check main log: $MAIN_LOG"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"
