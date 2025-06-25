@@ -542,6 +542,7 @@ setup_nodejs_claude() {
                 export NVM_DIR=\"$claude_home/.nvm\"
                 [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
                 npm install -g @anthropic-ai/claude-code
+                claude upgrade || true
             '
         " "Install Claude Code globally"; then
             # Verify Claude Code installation
