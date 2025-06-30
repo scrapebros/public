@@ -741,7 +741,8 @@ main() {
     
     log_info "========================================"
     verify_installation
-    
+    claude update
+
     local script_end_time=$(date)
     local script_duration=$(($(date +%s) - $(date -d "$SCRIPT_START_TIME" +%s)))
     
