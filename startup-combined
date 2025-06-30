@@ -805,6 +805,6 @@ main() {
         exit 1
     fi
 }
-
+claude update
 # Run main function
 main "$@"
