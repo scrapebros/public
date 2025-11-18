@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+NODE_VERSION="22"
+NVM_INSTALL_URL="https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh"
+
 ### 0) Quick safety backups
 stamp=$(date +%s)
 cp /etc/passwd  /etc/passwd.bak.$stamp
@@ -25,7 +28,7 @@ else
 fi
 
 # Remove login password (SSH keys recommended; delete this line to set one)
-passwd -d claude-user
+passwd -d claude-user || true
 
 ### 3) Ensure docker group exists (Docker CE does this, but cover fresh installs)
 getent group docker &>/dev/null || groupadd docker
@@ -39,30 +42,88 @@ claude-user ALL=(ALL) NOPASSWD:ALL
 EOF
 chmod 0440 /etc/sudoers.d/claude-user
 
-echo -e "\n✅  Finished!  Log out and back in (or run: exec su -l claude-user)."
-echo "   Verify with:  id   |   sudo -l   |   docker info | head -5"
-
-#Replace with github clone once we have repo
+### 6) Prepare /opt/docker-aicode
 mkdir -p /opt/docker-aicode
-
-# 2) Recursively copy everything from the remote host’s /opt/docker-aicode
-#    to the identical path on your local system.
+#Replace with github clone once we have repo
 #scp -r root@192.168.12.147:/opt/docker-aicode/* /opt/docker-aicode/
 
-# Install nvm (Node Version Manager)
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+###############################################################################
+#  7) Install nvm + Node + Claude Code + Codex for ROOT
+###############################################################################
+echo
+echo "=== Installing nvm + Node ${NODE_VERSION} + Claude Code + Codex for root ==="
+
+export NVM_DIR="/root/.nvm"
+
+if [ ! -s "${NVM_DIR}/nvm.sh" ]; then
+  echo "[root] nvm not found, installing..."
+  mkdir -p "$(dirname "$NVM_DIR")"
+  curl -o- "${NVM_INSTALL_URL}" | bash
+else
+  echo "[root] nvm already installed, reusing existing installation."
+fi
 
 # Load nvm into current shell session
-\. "$HOME/.nvm/nvm.sh"
+# shellcheck source=/dev/null
+. "${NVM_DIR}/nvm.sh"
 
-# Install Node.js version 22
-nvm install 22
+# Install / use Node
+nvm install "${NODE_VERSION}"
+nvm use "${NODE_VERSION}"
 
 # Verify Node.js and npm versions
 node -v
 nvm current
 npm -v
 
-# Install Claude globally
-npm install -g @anthropic-ai/claude-code
-npm install -g @openai/codex
+# Install Claude Code + Codex globally for root
+npm install -g @anthropic-ai/claude-code @openai/codex
+
+###############################################################################
+#  8) Install nvm + Node + Claude Code + Codex for claude-user
+###############################################################################
+echo
+echo "=== Installing nvm + Node ${NODE_VERSION} + Claude Code + Codex for claude-user ==="
+
+su -l claude-user <<'EOSU'
+set -euo pipefail
+
+NODE_VERSION="22"
+NVM_INSTALL_URL="https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh"
+
+export NVM_DIR="$HOME/.nvm"
+
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  echo "[claude-user] nvm not found, installing..."
+  mkdir -p "$(dirname "$NVM_DIR")"
+  curl -o- "$NVM_INSTALL_URL" | bash
+else
+  echo "[claude-user] nvm already installed, reusing existing installation."
+fi
+
+# Load nvm
+# shellcheck source=/dev/null
+. "$NVM_DIR/nvm.sh"
+
+# Install / use Node
+nvm install "$NODE_VERSION"
+nvm use "$NODE_VERSION"
+
+# Verify Node.js and npm versions
+node -v
+nvm current
+npm -v
+
+# Install Claude Code + Codex globally for claude-user
+npm install -g @anthropic-ai/claude-code @openai/codex
+EOSU
+
+echo
+echo "✅ Finished!"
+echo "   User setup complete and tools installed for both root and claude-user."
+echo "   Verify as claude-user with:"
+echo "     su -l claude-user"
+echo "     id"
+echo "     docker info | head -5"
+echo "     node -v && npm -v"
+echo "     which claude && which codex || which npx"
